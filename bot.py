@@ -43,11 +43,15 @@ def save_settings(settings):
 settings = load_settings()
 alert_sent = {pair: {"lower": False, "upper": False} for pair in settings.keys()}
 
+# ---- Состояния для пошагового диалога ----
+user_states = {}  # {chat_id: {'step': str, 'symbol': str, 'action': str}}
+
 def main_menu_keyboard():
     keyboard = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
     keyboard.add(
         KeyboardButton("💰 Цены"),
         KeyboardButton("📊 Статус"),
+        KeyboardButton("⚙️ Настроить границы"),
         KeyboardButton("➕ Добавить пару"),
         KeyboardButton("❌ Удалить пару"),
         KeyboardButton("📝 Помощь"),
@@ -55,6 +59,59 @@ def main_menu_keyboard():
     )
     return keyboard
 
+def cancel_keyboard():
+    keyboard = ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    keyboard.add(KeyboardButton("❌ Отмена"))
+    return keyboard
+
+def bound_type_keyboard():
+    keyboard = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    keyboard.add(
+        KeyboardButton("📉 Нижняя"),
+        KeyboardButton("📈 Верхняя"),
+        KeyboardButton("🔄 Диапазон"),
+        KeyboardButton("❌ Отмена")
+    )
+    return keyboard
+
+def ask_pair_selection(chat_id):
+    if not settings:
+        bot.send_message(chat_id, "Нет отслеживаемых пар. Добавьте пару через /add_pair")
+        return
+    keyboard = ReplyKeyboardMarkup(row_width=2, resize_keyboard=True)
+    for pair in settings.keys():
+        keyboard.add(KeyboardButton(pair))
+    keyboard.add(KeyboardButton("❌ Отмена"))
+    bot.send_message(chat_id, "Выберите пару:", reply_markup=keyboard)
+    user_states[chat_id] = {'step': 'select_pair'}
+
+def ask_bound_type(chat_id, symbol):
+    keyboard = bound_type_keyboard()
+    bot.send_message(chat_id, f"Что хотите изменить для {symbol}?", reply_markup=keyboard)
+    user_states[chat_id] = {'step': 'select_bound', 'symbol': symbol}
+
+def ask_number(chat_id, bound_name, action):
+    bot.send_message(chat_id, f"Введите {bound_name} (например, 50000 или 50,000.00):", reply_markup=cancel_keyboard())
+    user_states[chat_id]['step'] = 'awaiting_number'
+    user_states[chat_id]['action'] = action
+    user_states[chat_id]['bound_name'] = bound_name
+
+def ask_range_string(chat_id):
+    bot.send_message(chat_id, "Введите нижнюю и верхнюю границы через пробел (например, 50000 70000):", reply_markup=cancel_keyboard())
+    user_states[chat_id]['step'] = 'awaiting_range_string'
+    user_states[chat_id]['action'] = 'range'
+
+def normalize_price_string(s):
+    """Преобразует строку в число, убирая запятые и пробелы."""
+    s = s.strip().replace(' ', '').replace(',', '')
+    return float(s)
+
+def cancel_state(chat_id):
+    if chat_id in user_states:
+        del user_states[chat_id]
+    bot.send_message(chat_id, "Действие отменено.", reply_markup=main_menu_keyboard())
+
+# ============= БИЗНЕС-ЛОГИКА =============
 def symbol_is_valid(symbol):
     try:
         url = f"https://open-api.bingx.com/openApi/swap/v2/quote/price?symbol={symbol}"
@@ -85,7 +142,6 @@ def send_telegram_message(message):
     except Exception as e:
         print(f"❌ Ошибка отправки: {e}")
 
-# ============= ОБНОВЛЁННАЯ ФУНКЦИЯ МОНИТОРИНГА =============
 def check_all_prices():
     for pair, cfg in settings.items():
         price = get_current_price(pair)
@@ -96,7 +152,6 @@ def check_all_prices():
         lower = cfg["lower"]
         upper = cfg["upper"]
 
-        # Нижняя граница
         if price < lower:
             if not alert_sent[pair]["lower"]:
                 msg = (f"🔴 ВНИМАНИЕ! ЦЕНА УПАЛА!\n\n"
@@ -116,7 +171,6 @@ def check_all_prices():
                 send_telegram_message(msg)
                 alert_sent[pair]["lower"] = False
 
-        # Верхняя граница
         if price > upper:
             if not alert_sent[pair]["upper"]:
                 msg = (f"🟢 ВНИМАНИЕ! ЦЕНА ПОДНЯЛАСЬ!\n\n"
@@ -162,7 +216,8 @@ def send_welcome(message):
                      "/add_pair <символ> — добавить пару\n"
                      "/remove_pair <символ> — удалить пару\n"
                      "/help — полная справка\n"
-                     "/hide — убрать клавиатуру",
+                     "/hide — убрать клавиатуру\n"
+                     "/cancel — отменить текущее действие",
                      reply_markup=main_menu_keyboard())
 
 @bot.message_handler(commands=['help'])
@@ -178,7 +233,8 @@ def send_help(message):
         "`/remove_pair <символ>` – удалить пару из отслеживания\n"
         "`/start` – показать меню и приветствие\n"
         "`/help` – эта справка\n"
-        "`/hide` – убрать клавиатуру\n\n"
+        "`/hide` – убрать клавиатуру\n"
+        "`/cancel` – отменить текущее действие\n\n"
         "Для удобства используйте кнопки меню."
     )
     bot.send_message(message.chat.id, help_text, parse_mode="Markdown")
@@ -188,6 +244,10 @@ def hide_keyboard(message):
     hide_markup = ReplyKeyboardMarkup(remove_keyboard=True)
     bot.send_message(message.chat.id, "Клавиатура скрыта. Чтобы вернуть, введите /start", reply_markup=hide_markup)
 
+@bot.message_handler(commands=['cancel'])
+def cancel_command(message):
+    cancel_state(message.chat.id)
+
 @bot.message_handler(commands=['prices'])
 def send_prices(message):
     lines = []
@@ -196,7 +256,7 @@ def send_prices(message):
         if price is None:
             lines.append(f"❌ {pair}: ошибка получения цены")
         else:
-            lines.append(f" {pair}: ${price:,.2f}")
+            lines.append(f"💰 {pair}: ${price:,.2f}")
     bot.reply_to(message, "\n".join(lines))
 
 @bot.message_handler(commands=['status'])
@@ -206,24 +266,7 @@ def send_status(message):
         lines.append(f"{pair}: нижняя ${cfg['lower']:,.2f}, верхняя ${cfg['upper']:,.2f}")
     bot.reply_to(message, "\n".join(lines))
 
-def update_env_var(key, value):
-    env_file = ".env"
-    lines = []
-    found = False
-    if os.path.exists(env_file):
-        with open(env_file, "r") as f:
-            lines = f.readlines()
-    with open(env_file, "w") as f:
-        for line in lines:
-            if line.startswith(f"{key}="):
-                f.write(f"{key}={value}\n")
-                found = True
-            else:
-                f.write(line)
-        if not found:
-            f.write(f"{key}={value}\n")
-    load_dotenv(override=True)
-
+# ---- Обработчики команд с параметрами (старые) ----
 @bot.message_handler(commands=['set_range'])
 def set_range(message):
     try:
@@ -345,13 +388,109 @@ def remove_pair(message):
     except Exception as e:
         bot.reply_to(message, f"Ошибка: {e}")
 
+# ============= ОБРАБОТЧИКИ ТЕКСТА (кнопки и диалог) =============
 @bot.message_handler(func=lambda message: True)
-def handle_buttons(message):
+def handle_text(message):
+    chat_id = message.chat.id
     text = message.text
+
+    if chat_id in user_states:
+        state = user_states[chat_id]
+        step = state.get('step')
+
+        if text == "❌ Отмена":
+            cancel_state(chat_id)
+            return
+
+        # Обработка ввода одного числа (для Нижняя/Верхняя)
+        if step == 'awaiting_number':
+            try:
+                value = normalize_price_string(text)
+                if value <= 0:
+                    bot.reply_to(message, "Число должно быть положительным. Попробуйте снова.")
+                    return
+                symbol = state['symbol']
+                action = state['action']
+                if action == 'lower':
+                    settings[symbol]["lower"] = value
+                    save_settings(settings)
+                    if symbol in alert_sent:
+                        alert_sent[symbol]["lower"] = False
+                    bot.reply_to(message, f"✅ Нижняя граница для {symbol} установлена: ${value:,.2f}", reply_markup=main_menu_keyboard())
+                    cancel_state(chat_id)
+                elif action == 'upper':
+                    settings[symbol]["upper"] = value
+                    save_settings(settings)
+                    if symbol in alert_sent:
+                        alert_sent[symbol]["upper"] = False
+                    bot.reply_to(message, f"✅ Верхняя граница для {symbol} установлена: ${value:,.2f}", reply_markup=main_menu_keyboard())
+                    cancel_state(chat_id)
+            except ValueError:
+                bot.reply_to(message, "Ошибка! Введите число в формате 50000 или 50,000.00")
+            return
+
+        # Обработка ввода двух чисел для диапазона
+        if step == 'awaiting_range_string':
+            try:
+                parts = text.strip().split()
+                if len(parts) != 2:
+                    bot.reply_to(message, "Введите два числа через пробел, например: 50000 70000")
+                    return
+                lower = normalize_price_string(parts[0])
+                upper = normalize_price_string(parts[1])
+                if lower <= 0 or upper <= 0:
+                    bot.reply_to(message, "Числа должны быть положительными.")
+                    return
+                if lower >= upper:
+                    bot.reply_to(message, "Нижняя граница должна быть меньше верхней.")
+                    return
+                symbol = state['symbol']
+                settings[symbol]["lower"] = lower
+                settings[symbol]["upper"] = upper
+                save_settings(settings)
+                if symbol in alert_sent:
+                    alert_sent[symbol]["lower"] = False
+                    alert_sent[symbol]["upper"] = False
+                bot.reply_to(message, f"✅ Диапазон для {symbol} установлен:\n📉 Нижняя: ${lower:,.2f}\n📈 Верхняя: ${upper:,.2f}", reply_markup=main_menu_keyboard())
+                cancel_state(chat_id)
+            except ValueError:
+                bot.reply_to(message, "Ошибка! Введите два числа в формате 50000 или 50,000.00 через пробел.")
+            return
+
+        # Обработка выбора пары
+        if step == 'select_pair':
+            if text in settings:
+                ask_bound_type(chat_id, text)
+            else:
+                bot.reply_to(message, "Пара не найдена. Выберите из списка.")
+            return
+
+        # Обработка выбора типа настройки
+        if step == 'select_bound':
+            symbol = state['symbol']
+            if text == "📉 Нижняя":
+                ask_number(chat_id, 'нижнюю границу', 'lower')
+            elif text == "📈 Верхняя":
+                ask_number(chat_id, 'верхнюю границу', 'upper')
+            elif text == "🔄 Диапазон":
+                ask_range_string(chat_id)
+            elif text == "❌ Отмена":
+                cancel_state(chat_id)
+            else:
+                bot.reply_to(message, "Выберите, что менять, с помощью кнопок.")
+            return
+
+        # Если дошли сюда, значит состояние неизвестное — сбрасываем
+        cancel_state(chat_id)
+        return
+
+    # ---- Обработка кнопок (когда нет активного состояния) ----
     if text == "💰 Цены":
         send_prices(message)
     elif text == "📊 Статус":
         send_status(message)
+    elif text == "⚙️ Настроить границы":
+        ask_pair_selection(chat_id)
     elif text == "➕ Добавить пару":
         bot.reply_to(message, "Введите /add_pair <символ>\nПример: /add_pair XRP-USDT")
     elif text == "❌ Удалить пару":
@@ -360,6 +499,9 @@ def handle_buttons(message):
         send_help(message)
     elif text == "🔒 Скрыть меню":
         hide_keyboard(message)
+    else:
+        # Неизвестное сообщение – игнорируем
+        pass
 
 # ============= ЗАПУСК =============
 if __name__ == "__main__":
