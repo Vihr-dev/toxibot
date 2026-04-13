@@ -4,6 +4,12 @@ import threading
 import os
 import json
 import requests
+import os
+print("=== ALL ENV VARIABLES ===")
+for key, value in os.environ.items():
+    if 'TOKEN' in key or 'CHAT' in key or 'INTERVAL' in key:
+        print(f"{key}: {value}")
+print("=========================")
 from dotenv import load_dotenv
 from telebot.types import ReplyKeyboardMarkup, KeyboardButton
 
